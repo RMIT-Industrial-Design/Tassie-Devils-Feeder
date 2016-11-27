@@ -269,21 +269,17 @@ void loop() {
 
         // if its departure time
         if (theHour == hourDepart && theMin >= minuteDepart || theHour > hourDepart) {
-          // accellerate motor to max speed
-          if (accelDriveMotor()) {
-            // when at max speed change cart state to enroute
-            cartState = 1;
-            // save the cart state
-            EEPROM.write(8, cartState);
-          }
+          // change cart state to enroute
+          cartState = 1;
+          // save the cart state
+          EEPROM.write(8, cartState);
         }
 
         break;
 
       case 1:
-        // travelling to drop location
-        // ensure motor is on
-        analogWrite(DRIVE_PIN, MAX_SPEED);
+        // travel to drop location
+        accelDriveMotor();
 
         // look for location stripe with IR sensor
 
@@ -686,11 +682,14 @@ boolean accelDriveMotor() {
   if (motorSpeed < MAX_SPEED) {
     if ((currentTime() - lastMotorSetting) > ACCEL_RATE) {
       motorSpeed++;
-      analogWrite(DRIVE_PIN, motorSpeed);
       lastMotorSetting = currentTime();
     }
+    analogWrite(DRIVE_PIN, motorSpeed);
     return false;
-  } else return true;
+  } else {
+    analogWrite(DRIVE_PIN, motorSpeed);
+    return true;
+  }
 }
 
 
