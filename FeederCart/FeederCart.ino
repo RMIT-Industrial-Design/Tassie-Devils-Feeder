@@ -57,32 +57,28 @@
 
 */
 
-const boolean DEBUG = 0;
+const boolean DEBUG = 1;
 
 // Hardware Settings
-const byte Vss_PIN = 2;
+const byte MOTOR_INT_PIN = 2;
 const byte R_LED_PIN = 3;
 const byte G_LED_PIN = 5;
 const byte B_LED_PIN = 6;
-const byte IR_IN_PIN = 2;
-const byte IR_OUT_PIN = 4;
-const byte OP_IN_PIN = 7;
-const byte OP_OUT_PIN = 8;
-const byte DRIVE_PIN = 9;
-const byte LATCH_PIN = 10;
+const byte SERVO_PIN = 7;
+// const byte IR_IN_PIN = 8;
+// const byte IR_OUT_PIN = 4;
+// const byte OP_IN_PIN = 7;
+// const byte OP_OUT_PIN = 8;
+const byte DRIVE_PIN = 10;
 const byte BT_TX = 11;
 const byte BT_RX = 12;
-const byte VOLTAGE_PIN = A0;
-const byte HALL_PIN = A1;
+const byte LINE_PIN = A0;
+const byte VOLTAGE_PIN = A1;
 // I2c Bus is on A4 & A5
 
 // Security Bytes. These should match the Processing code
 const byte START_BYTES[4] = {'A', 'B', 'C', 'D'};
 
-// battery voltage multiplication factor.
-// circuit is a 1:10 ratio voltage divider with 3.3v reference.
-// multiplication factor was determined through experiemntation.
-const byte BAT_X_FACTOR = 36;
 // Default User Settings - generally only used once
 // These are overwritten by User Settings stored in EEPROM
 // turn the system on or off. default off.
@@ -98,14 +94,16 @@ const byte DROP_PEN = 0;
 // distance to end of line
 const byte END_DIST = 0;
 
+// battery voltage multiplication factor.
+// circuit is a 1:10 ratio voltage divider with 3.3v reference.
+// multiplication factor was determined through experiemntation.
+const byte BAT_X_FACTOR = 36;
 // Time between bluetooth checks
 const unsigned int BT_SLEEP = 2000;
 // maximum drive speed
 const byte MAX_SPEED = 255;
 // accelleration rate, bigger numbers result in slower accelleration
 const unsigned int ACCEL_RATE = 10;
-// reading from hall effect sensor when latch is open
-const unsigned int HALL_VAL = 500;
 
 // include the watchdog timer library
 #include <avr/wdt.h>
@@ -124,6 +122,16 @@ const unsigned long CLOCK_READ_INTERVAL = 60000;
 // Serial for bluetooth module
 #include <SoftwareSerial.h>
 SoftwareSerial BTserial(BT_TX, BT_RX);
+
+// Servo library for latch
+#include <Servo.h>
+Servo latchServo;  // create servo object to control a servo
+// Remember when Servo was moved
+unsigned long ServoStartTime = 0;
+// time before servo is reset
+const byte SERVO_RESET_TIME = 2000;
+const byte SERVO_HOME_POS = 10;
+const byte SERVO_RELEASE_POS = 100;
 
 #include <Narcoleptic.h>
 // remember sleep time because Narcoleptic.millis() doesn't seem to work
@@ -149,6 +157,12 @@ unsigned int endDist;
 // Machine State
 // waiting to travel = 0, traveling to drop = 1, dropping = 2, traveling to end = 3, at end = 4
 byte cartState = 0;
+
+// Setup motor photoInterupt counter
+boolean counterState = 0;
+// there will be 4 triggers per revolution
+// 1/4 wheel circumfrance = WHEEL_DIS
+const unsigned int WHEEL_DIS = 10;
 unsigned long distTravelled = 0;
 
 // Remember start times
@@ -194,14 +208,14 @@ void setup() {
   digitalWrite(B_LED_PIN, HIGH); // turn LED on
   LEDstartTime = currentTime();
 
-  pinMode(IR_IN_PIN, INPUT_PULLUP); // setup IR input
-  pinMode(IR_OUT_PIN, OUTPUT); // setup IR output
-  // turn it off
-
+  pinMode(MOTOR_INT_PIN, INPUT_PULLUP); // motor speed counter
   pinMode(DRIVE_PIN, OUTPUT);   // setup drive motor
   digitalWrite(DRIVE_PIN, LOW); // turn drive motor off
-  pinMode(LATCH_PIN, OUTPUT);   // setup latch motor
-  digitalWrite(LATCH_PIN, LOW); // turn latch motor off
+
+  // attach the servo
+  latchServo.attach(SERVO_PIN);
+  // send servo to home position
+  // closeLatch();
 
   // begin Wire I2C
   Wire.begin();
@@ -214,7 +228,7 @@ void setup() {
   // if the cart is enroute then there has been an error, the system has reset mid-journey
   if (cartState != 0 && cartState != 4) {
     // continue to end of line
-    // to be completed! noted in GitHub 
+    // to be completed! noted in GitHub
 
     if (DEBUG) Serial.println("ERROR: System has reset enroute");
   }
@@ -237,11 +251,14 @@ void loop() {
     digitalWrite(B_LED_PIN, LOW);
   }
 
+  // close latch servo
+  if (currentTime() - ServoStartTime > SERVO_RESET_TIME) closeLatch();
+
   // check for on-off status - is this needed?
   if (systemOnOff) {
 
     // action based on state
-    switch (minuteDepart) {
+    switch (cartState) {
       case 0:
         // waiting for departure
         // check RTC Time
@@ -251,7 +268,7 @@ void loop() {
         }
 
         // if its departure time
-        if (theHour >= hourDepart && theMin >= minuteDepart) {
+        if (theHour == hourDepart && theMin >= minuteDepart || theHour > hourDepart) {
           // accellerate motor to max speed
           if (accelDriveMotor()) {
             // when at max speed change cart state to enroute
@@ -269,6 +286,14 @@ void loop() {
         analogWrite(DRIVE_PIN, MAX_SPEED);
 
         // look for location stripe with IR sensor
+
+        // read the motor interupt
+        boolean newCounterState = digitalRead(MOTOR_INT_PIN);
+        if (newCounterState != counterState) {
+          // the motor has moved
+          distTravelled += WHEEL_DIS;
+          counterState = newCounterState;
+        }
 
         // check distanced travelled
         if (distTravelled >= dropDist) {
@@ -289,11 +314,12 @@ void loop() {
         // open latch
         openLatch();
         // accellerate motor to max speed
-        accelDriveMotor();
-        // change cart state to travelling to end of line
-        cartState = 3;
-        // save the cart state
-        EEPROM.write(8, cartState);
+        if (accelDriveMotor()) {
+          // when at max speed change cart state to travelling to end of line
+          cartState = 3;
+          // save the cart state
+          EEPROM.write(8, cartState);
+        }
 
         break;
 
@@ -669,19 +695,16 @@ boolean accelDriveMotor() {
 
 
 boolean openLatch() {
-  digitalWrite(LATCH_PIN, HIGH);
   // move to open position
-  while (analogRead(HALL_PIN) < HALL_VAL) {
-    // check for bluetooth data
-    if (BTserial.available()) {
-      getSerialData();
-      // respond to new data
+  latchServo.write(SERVO_RELEASE_POS);
+  // remember time
+  ServoStartTime = currentTime();
+}
 
-    }
-    delay(10);
-  }
-  // stop motor
-  digitalWrite(LATCH_PIN, LOW);
+
+boolean closeLatch() {
+  // move to close position
+  latchServo.write(SERVO_HOME_POS);
 }
 
 
