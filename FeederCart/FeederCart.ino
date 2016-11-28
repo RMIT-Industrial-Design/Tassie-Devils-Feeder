@@ -157,11 +157,12 @@ unsigned int endDist;
 // Machine State
 // waiting to travel = 0, traveling to drop = 1, dropping = 2, traveling to end = 3, at end = 4
 byte cartState = 0;
+byte currentPen = 0;
+byte errorState = 0;
 
 // Setup motor photoInterupt counter
-boolean counterState = 0;
 // there will be 4 triggers per revolution
-// 1/4 wheel circumfrance = WHEEL_DIS
+// 1/4 wheel circumfrance
 const unsigned int WHEEL_DIS = 10;
 unsigned long distTravelled = 0;
 
@@ -176,6 +177,20 @@ const byte LED_ON = 500;
 unsigned long lastMotorSetting = 0;
 // remember the motor speed
 unsigned int motorSpeed = 0;
+
+// setup color sensor
+#include "Adafruit_TCS34725.h"
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
+// color values for stripe sensor
+uint16_t clearVal, redVal, greenVal, blueVal;
+const unsigned int RED_THRESHOLD = 200;
+boolean stripeState = 0;
+// Remember when the reading was requested
+unsigned long stripeSensorTime = 0;
+// remember if reading has been requested
+boolean stripeSensorState = 0;
+// duration of wait between request and data - takes 50ms to read
+const byte STRIPE_SENSOR_WAIT = 60;
 
 // remember reading time and check for Millsecond rollover
 unsigned long lastMillis = 0;
@@ -208,14 +223,16 @@ void setup() {
   digitalWrite(B_LED_PIN, HIGH); // turn LED on
   LEDstartTime = currentTime();
 
-  pinMode(MOTOR_INT_PIN, INPUT_PULLUP); // motor speed counter
+  pinMode(MOTOR_INT_PIN, INPUT_PULLUP);
+  // attachInterrupt(<interruptPin>,<interruptServiceRoutine>,<trigger>);
+  // interruptPin is 0 or 1, for digital pin 2 or 3, interruptServiceRoutine is the function to run
+  // trigger is what will cause the ISR to run, can be LOW, RISING, FALLING or CHANGE
+  attachInterrupt(0, updatePosition, RISING);
   pinMode(DRIVE_PIN, OUTPUT);   // setup drive motor
   digitalWrite(DRIVE_PIN, LOW); // turn drive motor off
 
   // attach the servo
   latchServo.attach(SERVO_PIN);
-  // send servo to home position
-  // closeLatch();
 
   // begin Wire I2C
   Wire.begin();
@@ -225,10 +242,20 @@ void setup() {
   if (DEBUG) Serial.println("RTC ON");
   checkTime();
 
+  // color sensor begin
+  if (tcs.begin()) {
+    if (DEBUG) Serial.println("Found TCS34725 sensor.");
+  } else {
+    if (DEBUG) Serial.println("No TCS34725 sensor found.");
+    errorState = 101;
+  }
+
   // if the cart is enroute then there has been an error, the system has reset mid-journey
   if (cartState != 0 && cartState != 4) {
-    // continue to end of line
-    // to be completed! noted in GitHub
+    // change cart state to travel to end of line
+    cartState = 3;
+    EEPROM.write(8, cartState);
+    // set the error code - cart reset
 
     if (DEBUG) Serial.println("ERROR: System has reset enroute");
   }
@@ -281,48 +308,76 @@ void loop() {
         // travel to drop location
         accelDriveMotor();
 
-        // look for location stripe with IR sensor
+        // check for color stripe on rope
+        if (currentTime() - stripeSensorTime > STRIPE_SENSOR_WAIT) {
+          if (stripeSensorState) {
+            // get reading
+            tcs.getRawData(&redVal, &greenVal, &blueVal, &clearVal);
+            // turn off LED
+            tcs.setInterrupt(true);
 
-        // read the motor interupt
-        boolean newCounterState = digitalRead(MOTOR_INT_PIN);
-        if (newCounterState != counterState) {
-          // the motor has moved
-          distTravelled += WHEEL_DIS;
-          counterState = newCounterState;
+            if (DEBUG) Serial.print("C:\t"); Serial.print(clearVal);
+            if (DEBUG) Serial.print("\tR:\t"); Serial.print(redVal);
+            if (DEBUG) Serial.print("\tG:\t"); Serial.print(greenVal);
+            if (DEBUG) Serial.print("\tB:\t"); Serial.print(blueVal);
+
+            // if the reading is red then
+            if (redVal > RED_THRESHOLD && !stripeState) {
+              // add to current pen number
+              currentPen++;
+              stripeState == true;
+            } else {
+              stripeState == false;
+            }
+
+            // reset sensor state
+            stripeSensorState = false;
+
+          } else {
+            // request color reading - turn on LED
+            tcs.setInterrupt(false);
+            // set sensor state
+            stripeSensorState = true;
+          }
+
+          stripeSensorTime = currentTime();
         }
 
         // check distanced travelled
         if (distTravelled >= dropDist) {
-          // stop drive motor
-          digitalWrite(DRIVE_PIN, LOW);
-          // change cart state to dropping food
-          cartState = 2;
-          // save the cart state
-          EEPROM.write(8, cartState);
+          // safety check - if pen can't be confirmed then dont drop food
+          if (currentPen == dropPen) {
+            // change cart state to dropping food
+            cartState = 2;
+            // save the cart state
+            EEPROM.write(8, cartState);
+          } else {
+            // distance error - not the correct pen
+            // change cart state to travel to end of line
+            cartState = 3;
+            EEPROM.write(8, cartState);
+          }
         }
 
         break;
 
       case 2:
         // dropping food
-        // ensure motor is off
-        digitalWrite(DRIVE_PIN, LOW);
+        // ensure motor is off - is this necessary?
+        // stopDriveMotor();
+        // digitalWrite(DRIVE_PIN, LOW);
         // open latch
         openLatch();
-        // accellerate motor to max speed
-        if (accelDriveMotor()) {
-          // when at max speed change cart state to travelling to end of line
-          cartState = 3;
-          // save the cart state
-          EEPROM.write(8, cartState);
-        }
+        // change cart state to travelling to end of line
+        cartState = 3;
+        // save the cart state
+        EEPROM.write(8, cartState);
 
         break;
 
       case 3:
         // travelling to end of line
-        // ensure motor is on
-        analogWrite(DRIVE_PIN, MAX_SPEED);
+        accelDriveMotor();
 
         // look for location stripe with IR sensor
 
@@ -692,6 +747,15 @@ boolean accelDriveMotor() {
   }
 }
 
+void updatePosition()
+{
+  if (DEBUG) Serial.println("Motor Interupt Triggered");
+  if (cartState == 1 || cartState == 2 || cartState == 3) {
+    distTravelled += WHEEL_DIS;
+    if (DEBUG) Serial.print("Distance: ");
+    if (DEBUG) Serial.println(distTravelled);
+  }
+}
 
 boolean openLatch() {
   // move to open position
